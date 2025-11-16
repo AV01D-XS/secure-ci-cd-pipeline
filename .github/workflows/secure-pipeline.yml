@@ -95,7 +95,7 @@ jobs:
 
       - name: Upload semgrep results
         if: always()
-        uses: actions/upload-artifact@v3  # Note: using v3, we haven't updated this one yet
+        uses: actions/upload-artifact@v3
         with:
           name: semgrep-results-${{ github.sha }}
           path: semgrep-results.json
@@ -104,7 +104,7 @@ jobs:
   build-and-scan:
     name: Build & Security Scan
     runs-on: ubuntu-latest
-    needs: [lint-and-test, secret-scan]  # Don't wait for SAST which can be slow
+    needs: [lint-and-test, secret-scan]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -115,24 +115,35 @@ jobs:
           driver-opts: |
             image=moby/buildkit:buildx-stable-1
 
-      - name: Build container image
+      - name: Build container image (multiple targets)
         uses: docker/build-push-action@v4
         with:
           context: .
           file: Dockerfile
-          load: true  # Keep locally for scanning
-          tags: ${{ env.APP_NAME }}:${{ env.IMAGE_TAG }}
+          load: true
+          tags: |
+            ${{ env.APP_NAME }}:${{ env.IMAGE_TAG }}
+            ${{ env.APP_NAME }}-test:${{ env.IMAGE_TAG }}
+          target: runtime  # Explicitly build runtime target
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          # Using GitHub's cache for build layers
 
+      - name: Build test image for integration tests
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          file: Dockerfile
+          load: true
+          tags: ${{ env.APP_NAME }}-test:${{ env.IMAGE_TAG }}
+          target: test  # Build test target separately
+          
       - name: Run Trivy vulnerability scanner
-        uses: aquasecurity/trivy-action@v0.14.0  # Pinned to older version that we trust
+        uses: aquasecurity/trivy-action@v0.14.0
         with:
           image-ref: ${{ env.APP_NAME }}:${{ env.IMAGE_TAG }}
           format: sarif
           output: trivy-results.sarif
-          severity: CRITICAL,HIGH  # Only fail on high+ severity
+          severity: CRITICAL,HIGH
 
       - name: Upload Trivy results
         uses: actions/upload-artifact@v3
@@ -169,11 +180,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Run integration tests
+      - name: Run integration tests in test container
         run: |
           docker run --network host \
             -e DATABASE_URL=postgresql://postgres:postgres@localhost:5432/test_db \
-            ${{ env.APP_NAME }}:${{ env.IMAGE_TAG }} \
+            ${{ env.APP_NAME }}-test:${{ env.IMAGE_TAG }} \
             pytest tests/integration/ -v
 
   deploy-staging:
@@ -202,7 +213,7 @@ jobs:
     name: Update Security Dashboard
     runs-on: ubuntu-latest
     needs: [sast-scan, build-and-scan]
-    if: always()  # Run even if previous jobs failed
+    if: always()
     steps:
       - name: Download scan results
         uses: actions/download-artifact@v3
@@ -215,7 +226,6 @@ jobs:
             --semgrep /tmp/artifacts/semgrep-results-*/semgrep-results.json \
             --trivy /tmp/artifacts/trivy-results/trivy-results.sarif \
             --output security-report.json
-        # This script posts to our internal security dashboard
 
       - name: Upload security report
         uses: actions/upload-artifact@v3
