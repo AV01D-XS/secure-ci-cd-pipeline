@@ -22,11 +22,18 @@ RUN groupadd -g ${APP_GID} ${APP_USER} && \
 WORKDIR /src
 
 # copy only requirements first for better caching
-COPY src/app/requirements.txt .
+COPY src/app/requirements*.txt ./
+COPY src/app/requirements-dev.txt ./
 RUN ${VENV_PATH}/bin/pip install --no-cache-dir -r requirements.txt
 
-# copy application
+# copy application and tests
 COPY src/app/ ./
+COPY tests/ ./tests/
+
+# ---- Test stage ----
+FROM builder AS test
+# Install test dependencies
+RUN ${VENV_PATH}/bin/pip install --no-cache-dir -r requirements-dev.txt
 
 # ---- Runtime stage ----
 FROM python:3.11-slim AS runtime
@@ -38,8 +45,8 @@ ENV VENV_PATH=/opt/venv
 ENV PATH="${VENV_PATH}/bin:$PATH"
 ENV PYTHONUNBUFFERED=1
 
-# minimal runtime deps
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+# minimal runtime deps including curl for healthcheck
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && rm -rf /var/lib/apt/lists/*
 
 # create non-root user and group
 RUN groupadd -g ${APP_GID} ${APP_USER} && \
@@ -47,7 +54,7 @@ RUN groupadd -g ${APP_GID} ${APP_USER} && \
 
 # copy virtualenv from builder
 COPY --from=builder ${VENV_PATH} ${VENV_PATH}
-# copy code
+# copy code (excluding tests in production)
 COPY --from=builder /src /app
 
 WORKDIR /app
@@ -58,7 +65,7 @@ USER ${APP_USER}
 # runtime port (documented)
 EXPOSE 8080
 
-# Use a healthcheck for orchestration readiness
+# Healthcheck with curl (now available)
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
   CMD curl -f http://localhost:8080/healthz || exit 1
 
