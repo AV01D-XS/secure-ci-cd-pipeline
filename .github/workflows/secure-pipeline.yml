@@ -1,0 +1,166 @@
+name: Secure CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  APP_NAME: demo-app
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  lint-and-test:
+    name: Lint & Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+
+      - name: Install dev requirements
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r src/app/requirements-dev.txt
+
+      - name: Run linters (flake8)
+        run: |
+          flake8 src || (echo "::error ::flake8 found issues" && exit 1)
+      - name: Run static security checks (Bandit)
+        run: |
+          bandit -r src || (echo "::error ::bandit found issues" && exit 1)
+
+      - name: Run unit tests (pytest)
+        run: |
+          pytest -q
+
+  secret-scan:
+    name: Repository Secret Scan
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Gitleaks scan
+        uses: zricethezav/gitleaks-action@v2
+        with:
+          args: detect --verbose
+        continue-on-error: false
+
+  semgrep-sast:
+    name: Semgrep (SAST) Scan
+    runs-on: ubuntu-latest
+    needs: secret-scan
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Semgrep
+        run: |
+          python -m pip install --upgrade pip
+          pip install semgrep
+
+      - name: Run semgrep (SAST)
+        run: |
+          semgrep -c auto --json --output semgrep-results.json src || echo "Semgrep found issues"
+      - name: Upload semgrep report
+        uses: actions/upload-artifact@v4
+        with:
+          name: semgrep-results
+          path: semgrep-results.json
+
+  build-and-image-scan:
+    name: Build Image & Container Scanning
+    runs-on: ubuntu-latest
+    needs: semgrep-sast
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU (for cross-build)
+        uses: docker/setup-qemu-action@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Login to GitHub Container Registry (optional)
+        if: ${{ secrets.GHCR_TOKEN != '' }}
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GHCR_TOKEN }}
+
+      - name: Build Docker image (multi-stage)
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: false
+          tags: ${{ env.APP_NAME }}:${{ env.IMAGE_TAG }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.repository }}
+
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@v2
+        with:
+          image-ref: ${{ env.APP_NAME }}:${{ env.IMAGE_TAG }}
+          format: table
+          exit-code: '1'        # fail job on vulnerabilities found
+          severity: CRITICAL,HIGH
+
+  dast-optional:
+    name: DAST - OWASP ZAP (Optional)
+    runs-on: ubuntu-latest
+    needs: build-and-image-scan
+    if: ${{ always() }}   # keep optional so pipeline can skip or be configured
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Start demo app (docker-compose)
+        run: |
+          docker-compose -f tests/docker-compose.yml up -d
+        # ensure tests/docker-compose.yml exists and exposes app on port 8080
+
+      - name: Run OWASP ZAP Baseline Scan
+        uses: zaproxy/action-baseline@v0.6.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          zap_args: -t http://localhost:8080 -r zap_report.html
+
+      - name: Upload ZAP report
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-report
+          path: zap_report.html
+
+  publish-artifacts:
+    name: Upload Pipeline Artifacts (reports)
+    runs-on: ubuntu-latest
+    needs: [build-and-image-scan, semgrep-sast, secret-scan]
+    steps:
+      - name: Download semgrep results
+        uses: actions/download-artifact@v4
+        with:
+          name: semgrep-results
+          path: reports/ || true
+
+      - name: Upload combined reports artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-reports
+          path: reports
